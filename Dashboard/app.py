@@ -54,7 +54,7 @@ st.markdown("""
 .metric-card:hover{border-color:rgba(33,230,255,.78);box-shadow:0 22px 55px rgba(0,0,0,.45),0 0 30px rgba(33,230,255,.22);transform:translateY(-2px);transition:.2s ease;}
 .metric-icon{height:46px;width:62px;display:flex;align-items:center;justify-content:center;border-radius:15px;font-size:13px;font-weight:900;letter-spacing:.7px;background:linear-gradient(135deg,rgba(35,136,255,.40),rgba(33,230,255,.16));border:1px solid rgba(33,230,255,.65);margin-bottom:10px;box-shadow:0 0 18px rgba(33,230,255,.20);}
 .metric-title{font-size:12px;color:#9fc7ff;font-weight:900;text-transform:uppercase;letter-spacing:.55px;}
-.metric-value{font-size:25px;font-weight:900;color:white;margin-top:6px;white-space:nowrap;}
+.metric-value{font-size:clamp(18px,1.55vw,25px);font-weight:900;color:white;margin-top:6px;white-space:normal;overflow-wrap:anywhere;line-height:1.15;}
 .metric-sub{font-size:12px;color:#28ff8f;margin-top:8px;font-weight:800;}
 .chart-card{
   background:linear-gradient(145deg,rgba(7,26,61,.96),rgba(3,12,31,.98));
@@ -98,6 +98,75 @@ def number(x):
     if abs(x) >= 1_000_000: return f"{x/1_000_000:.2f}M"
     if abs(x) >= 1_000: return f"{x/1_000:.2f}K"
     return f"{x:,.0f}"
+
+def make_abc_ved_summary(df):
+    """Create ABC-VED product summary for dashboard.
+    Uses existing ABC/VED/ABC_VED columns if available; otherwise derives
+    ABC from revenue and approximates VED from construction-product keywords.
+    """
+    if df.empty or "product" not in df.columns or "net_amount" not in df.columns:
+        return pd.DataFrame()
+
+    work = df.copy()
+    work["product"] = work["product"].astype(str).str.strip()
+    work["net_amount"] = pd.to_numeric(work["net_amount"], errors="coerce").fillna(0)
+    if "quantity" in work.columns:
+        work["quantity"] = pd.to_numeric(work["quantity"], errors="coerce").fillna(0)
+    else:
+        work["quantity"] = 0
+
+    prod = (
+        work.groupby("product", as_index=False)
+        .agg(total_sales=("net_amount", "sum"), quantity_sold=("quantity", "sum"), transactions=("invoice_id", "nunique"))
+        .sort_values("total_sales", ascending=False)
+    )
+    if prod.empty or prod["total_sales"].sum() <= 0:
+        return pd.DataFrame()
+
+    # ABC from cumulative sales value
+    prod["cum_pct"] = prod["total_sales"].cumsum() / prod["total_sales"].sum()
+    prod["ABC"] = np.select(
+        [prod["cum_pct"] <= 0.80, prod["cum_pct"] <= 0.95],
+        ["A", "B"],
+        default="C"
+    )
+
+    # Prefer existing VED/ABC_VED columns from the uploaded file if available
+    lower_cols = {c.lower(): c for c in work.columns}
+    ved_col = next((lower_cols[c] for c in ["ved", "ved_class", "ved_category"] if c in lower_cols), None)
+    abcved_col = next((lower_cols[c] for c in ["abc_ved", "abc-ved", "abcved"] if c in lower_cols), None)
+
+    if abcved_col:
+        existing = work[["product", abcved_col]].dropna().copy()
+        existing[abcved_col] = existing[abcved_col].astype(str).str.upper().str.replace("-", "", regex=False).str.strip()
+        existing = existing[existing[abcved_col].str.len() >= 2]
+        mode_map = existing.groupby("product")[abcved_col].agg(lambda x: x.mode().iat[0] if not x.mode().empty else x.iloc[0])
+        prod["ABC_VED"] = prod["product"].map(mode_map)
+        prod["VED"] = prod["ABC_VED"].astype(str).str[-1]
+        prod["ABC"] = prod["ABC_VED"].astype(str).str[0]
+    else:
+        if ved_col:
+            existing = work[["product", ved_col]].dropna().copy()
+            existing[ved_col] = existing[ved_col].astype(str).str.upper().str[0]
+            existing = existing[existing[ved_col].isin(["V", "E", "D"])]
+            mode_map = existing.groupby("product")[ved_col].agg(lambda x: x.mode().iat[0] if not x.mode().empty else x.iloc[0])
+            prod["VED"] = prod["product"].map(mode_map)
+        else:
+            vital_keywords = r"cement|rebar|tmt|steel|pipe|ms |gi |wire|nail|screw|rod|angle|channel|sheet|plywood|welding|electrode|sand|aggregate"
+            essential_keywords = r"paint|primer|brush|fitting|valve|tap|socket|switch|cable|glue|adhesive|sealant|hinge|lock|bolt|nut|washer|cpvc|pvc"
+            name = prod["product"].str.lower()
+            prod["VED"] = np.select(
+                [name.str.contains(vital_keywords, na=False, regex=True), name.str.contains(essential_keywords, na=False, regex=True)],
+                ["V", "E"],
+                default="D"
+            )
+        prod["VED"] = prod["VED"].fillna("D")
+        prod["ABC_VED"] = prod["ABC"] + prod["VED"]
+
+    prod["Sales Value"] = prod["total_sales"].round(2)
+    prod["Quantity Sold"] = prod["quantity_sold"].round(2)
+    prod["Transactions"] = prod["transactions"].astype(int)
+    return prod
 
 def chart_theme(fig, height=540):
     fig.update_layout(
@@ -1006,6 +1075,65 @@ elif page == "Branches & Products":
             st.info("ABC analysis is not available for the selected filters.")
 
         section_end()
+
+
+    section_start("ABC-VED Product Classification")
+
+    abc_ved_df = make_abc_ved_summary(filtered)
+
+    if abc_ved_df.empty:
+        st.info("ABC-VED analysis is not available for the selected filters.")
+    else:
+        abc_ved_counts = abc_ved_df["ABC_VED"].value_counts().reset_index()
+        abc_ved_counts.columns = ["ABC_VED", "count"]
+        abc_ved_counts = abc_ved_counts.sort_values("ABC_VED")
+
+        custom_colors = [
+            "#264653", "#2A9D8F", "#E9C46A", "#F4A261", "#E76F51",
+            "#8AB17D", "#6D597A", "#B56576", "#457B9D"
+        ]
+
+        fig = go.Figure(data=[go.Pie(
+            labels=abc_ved_counts["ABC_VED"],
+            values=abc_ved_counts["count"],
+            hole=0.55,
+            textinfo="label+percent",
+            sort=False,
+            marker=dict(colors=custom_colors[:len(abc_ved_counts)], line=dict(color="white", width=2)),
+            hovertemplate="<b>%{label}</b><br>Products: %{value:,}<br>Share: %{percent}<extra></extra>"
+        )])
+        fig.add_annotation(
+            text="ABC-VED<br><b>PRODUCTS</b>",
+            x=.5, y=.5, showarrow=False,
+            font=dict(size=17, color="white")
+        )
+        fig.update_layout(title=dict(text="Distribution of Products Across ABC-VED Categories", x=0.5))
+        st.plotly_chart(chart_theme(fig, 520), use_container_width=True, config=CHART_CONFIG)
+
+        selected_abc_ved = st.selectbox(
+            "Select ABC-VED class to view products",
+            sorted(abc_ved_df["ABC_VED"].dropna().unique()),
+            key="abc_ved_class_selector"
+        )
+
+        class_products = (
+            abc_ved_df[abc_ved_df["ABC_VED"] == selected_abc_ved]
+            .sort_values("total_sales", ascending=False)
+            .copy()
+        )
+
+        st.markdown(
+            f"<div class='small-muted'>Showing <b>{len(class_products):,}</b> products under class <b>{selected_abc_ved}</b></div>",
+            unsafe_allow_html=True
+        )
+
+        st.dataframe(
+            class_products[["product", "ABC", "VED", "ABC_VED", "Sales Value", "Quantity Sold", "Transactions"]],
+            hide_index=True,
+            use_container_width=True
+        )
+
+    section_end()
 
 # ---------------- Footer ----------------
 f1, f2, f3, f4 = st.columns(4)
